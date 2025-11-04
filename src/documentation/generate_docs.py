@@ -82,10 +82,6 @@ For each function/class defined:
 - Identify code that violates **separation of concerns**.
 - Suggest how the module can be adapted for future scaling.
 
-#### 8. Testing & QA Recommendations
-- Suggest **unit test cases** for key functions.
-- Recommend **mocking/stubbing strategies** for external dependencies.
-- Identify untested branches or error conditions.
 
 #### 9. Environment & Dependencies
 - List dependencies, frameworks, and APIs used.

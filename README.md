@@ -151,11 +151,7 @@ After running, you'll find:
 pip install -r requirements.txt
 ```
 
-### Neo4j Connection Issues
-```bash
-# Start Neo4j using Docker
-docker run --name neo4j -p 7474:7474 -p 7687:7687 neo4j:latest
-```
+
 
 ### ChromaDB Errors
 ```bash

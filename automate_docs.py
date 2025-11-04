@@ -37,51 +37,10 @@ from src.chunking.chunk_code import PyCodeChunker, chunk_directory
 from src.embedding.embed_chunks import ChunkEmbedder
 from src.graph.generate_call_graph import Neo4jGraphBuilder, PyCGCallGraphGenerator
 from src.rag.rag_context import RAGContextRetriever
-# Replace Hugging Face Gemma with Google Gemini API
 import google.generativeai as genai
-from src.reassembly.reassemble_docs import DocReassembler, reassemble_docs
+from src.reassembly.reassemble_docs import DocReassembler
 from src.web.sphinx_builder import SphinxBuilder
 from src.utils.helpers import save_chunks_to_jsonl, load_chunks_from_jsonl, group_chunks_by_file, extract_project_stats
-
-class GeminiDocGenerator:
-    """Generates documentation using Google's Gemini API."""
-
-    def __init__(self, model_name: str = "gemini-2.5-flash"):
-        self.model_name = model_name
-        self._model = None
-
-    def _get_model(self):
-        if self._model is None:
-            self._model = genai.GenerativeModel(self.model_name)
-        return self._model
-
-    def generate_documentation(self, code_chunk: str, context_chunks: List[Dict[str, Any]]) -> str:
-        """Build a prompt with code and RAG context and call Gemini to generate docs."""
-        try:
-            context_texts: List[str] = []
-            for ctx in context_chunks or []:
-                # ctx may be dicts with 'text' or similar; fall back to str(ctx)
-                text = ctx.get("text") if isinstance(ctx, dict) else None
-                context_texts.append(text if isinstance(text, str) else str(ctx))
-
-            prompt = (
-                "You are an expert software documentation generator.\n"
-                "Given a Python code chunk and optional related context, write clear,\n"
-                "concise, and comprehensive documentation that explains: purpose, public API,\n"
-                "parameters, return values, side effects, exceptions, dependencies, and examples.\n\n"
-                "Code chunk:\n" + code_chunk + "\n\n"
-                "Related context (may include referenced symbols, neighboring functions, or usage):\n"
-                + ("\n\n".join(context_texts) if context_texts else "(none)") + "\n\n"
-                "Produce well-structured Markdown suitable for Sphinx."
-            )
-
-            model = self._get_model()
-            response = model.generate_content(prompt)
-            # google-generativeai returns .text for concatenated parts
-            return getattr(response, "text", "") or ""
-        except Exception as exc:
-            logger.warning(f" Gemini generation failed, returning empty doc: {exc}")
-            return ""
 
 class DocumentationPipeline:
     """Main pipeline orchestrator for automated documentation generation."""
@@ -101,13 +60,12 @@ class DocumentationPipeline:
         self.neo4j_uri = neo4j_uri or os.getenv('NEO4J_URI', 'neo4j://127.0.0.1:7687')
         self.output_dir = Path(output_dir)
         self.docs_output_dir = Path(docs_output_dir)
-        # Configure Google Gemini API key (CLI arg takes precedence, then env)
         self.google_api_key = google_api_key or os.getenv("GOOGLE_API_KEY")
         if self.google_api_key:
             try:
                 genai.configure(api_key=self.google_api_key)
             except Exception as e:
-                logger.warning(f" Failed to configure Gemini API: {e}")
+                logger.warning(f" Failed to configure Gemma: {e}")
         
         # Ensure output directories exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -118,7 +76,7 @@ class DocumentationPipeline:
     def run(self):
         """Execute the complete documentation pipeline."""
         logger.info("=" * 80)
-        logger.info("🚀 Starting Automated Documentation Pipeline")
+        logger.info(" Starting Automated Documentation Pipeline")
         logger.info("=" * 80)
         
         try:
@@ -130,50 +88,162 @@ class DocumentationPipeline:
                 logger.error(" No chunks generated. Aborting.")
                 return False
             
-            logger.info(f"✓ Generated {len(chunks)} chunks")
+            logger.info(f"Generated {len(chunks)} chunks")
             save_chunks_to_jsonl(chunks, str(self.chunks_output))
             
             # STEP 2: Embedding
             logger.info("\n[STEP 2/7]  Generating embeddings and storing in ChromaDB...")
             embedder = ChunkEmbedder(chroma_path=self.chroma_path)
             embedder.embed_chunks(chunks)
-            logger.info(f"✓ Stored {len(chunks)} chunks in ChromaDB")
+            logger.info(f" Stored {len(chunks)} chunks in ChromaDB")
             
             # STEP 3: Call Graph Generation
             logger.info("\n[STEP 3/7]  Generating call graph and storing in Neo4j...")
             try:
                 generator = PyCGCallGraphGenerator()
                 generator.generate_call_graph(str(self.project_path), self.neo4j_uri)
-                logger.info("✓ Generated call graph")
+                logger.info(" Generated call graph")
             except Exception as e:
                 logger.warning(f" Call graph generation failed (continuing): {e}")
             
             # STEP 4: RAG Context Retrieval
-            logger.info("\n[STEP 4/7]  Retrieving RAG context from CodexGLUE...")
+            
             rag_retriever = RAGContextRetriever(rag_chroma_path=self.rag_chroma_path)
-            logger.info("✓ RAG context retriever ready")
+           
             
             # STEP 5: Generate Documentation
-            logger.info("\n[STEP 5/7]   Generating documentation using Gemini API...")
-            doc_generator = GeminiDocGenerator(model_name="gemini-2.5-flash")
+            logger.info("\n[STEP 5/7]   Generating documentation using LLM...")
+            doc_generator = DocGenerator()
+            dep_resolver = GraphDependencyResolver(self.neo4j_uri)
             
             docs = []
+            per_chunk_deps: List[List[Dict[str, Any]]] = []
+            dep_csv_rows: List[str] = ["file,chunk_name,chunk_start,chunk_end,dep_name,dep_location,direction,source"]
             for i, chunk in enumerate(chunks):
                 logger.info(f"   Processing chunk {i+1}/{len(chunks)}: {chunk.get('name', 'unknown')}")
                 
                 # Retrieve RAG context
                 context_chunks = rag_retriever.retrieve_context(chunk['text'], n_results=5)
+                # Resolve dependencies via graph (with AST fallback)
+                deps, dep_source = dep_resolver.resolve_for_chunk_with_source(chunk)
+                per_chunk_deps.append(deps)
+                # record CSV rows
+                for d in deps:
+                    dep_csv_rows.append(
+                        f"{chunk.get('filepath','')},{chunk.get('name','')},{chunk.get('start_line',0)},{chunk.get('end_line',0)},{d.get('name','')},{d.get('location','')},{d.get('direction','outgoing')},{dep_source}"
+                    )
                 
                 # Generate documentation
-                doc = doc_generator.generate_documentation(chunk['text'], context_chunks)
+                doc = doc_generator.generate_chunk_doc(chunk, deps, context_chunks)
                 docs.append(doc)
             
-            logger.info(f"✓ Generated documentation for {len(docs)} chunks")
+            logger.info(f" Generated documentation for {len(docs)} chunks")
             
-            # STEP 6: Reassemble Documentation
-            logger.info("\n[STEP 6/7]  Reassembling documentation by file...")
-            file_docs = reassemble_docs(chunks, docs, str(self.output_dir))
-            logger.info(f"✓ Reassembled documentation for {len(file_docs)} files")
+            # STEP 6: Reassemble Documentation and append file-level summaries
+            logger.info("\n[STEP 6/7]  Reassembling documentation by file and generating file summaries...")
+            reassembler = DocReassembler(str(self.output_dir))
+            file_to_chunks: Dict[str, List[Dict[str, Any]]] = {}
+            file_to_docs: Dict[str, List[str]] = {}
+            file_to_deps: Dict[str, List[Dict[str, Any]]] = {}
+            for idx, ch in enumerate(chunks):
+                fp = ch["filepath"]
+                file_to_chunks.setdefault(fp, []).append(ch)
+                file_to_docs.setdefault(fp, []).append(docs[idx] if idx < len(docs) else "")
+                for d in per_chunk_deps[idx] if idx < len(per_chunk_deps) else []:
+                    file_to_deps.setdefault(fp, []).append(d)
+
+            # Build combined file docs in original order
+            combined_docs: Dict[str, str] = {}
+            for fp, ch_list in file_to_chunks.items():
+                # sort by line
+                pairs = list(zip(ch_list, file_to_docs.get(fp, [])))
+                pairs.sort(key=lambda x: x[0]['start_line'])
+                combined = [f"# File: {fp}\n"]
+                for i, (ch, doc) in enumerate(pairs, 1):
+                    combined.append(f"\n## Chunk {i} (lines {ch['start_line']}-{ch['end_line']})\n\n")
+                    # Include the exact chunk code for reference
+                    combined.append("```python\n" + (ch.get('text','')) + "\n```\n\n")
+                    combined.append(doc)
+                    combined.append("\n---\n")
+                # File summary at end
+                file_summary = doc_generator.generate_file_summary(fp, [p[0] for p in pairs], file_to_deps.get(fp, []))
+                if file_summary:
+                    combined.append("\n\n" + file_summary + "\n")
+                combined_docs[fp] = "\n".join(combined)
+
+            # Save to disk and create index
+            reassembler.save_file_docs(combined_docs, preserve_structure=True)
+            index = reassembler.create_index(combined_docs)
+            (reassembler.output_dir / "index.md").write_text(index)
+            logger.info(f"Reassembled documentation for {len(combined_docs)} files")
+
+            # Write dependency CSV (especially useful if AST fallback was used)
+            try:
+                dep_csv_path = self.output_dir / "function_dependencies.csv"
+                dep_csv_path.write_text("\n".join(dep_csv_rows), encoding="utf-8")
+                logger.info(f"Wrote dependency CSV to {dep_csv_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write dependency CSV: {e}")
+
+            # Generate README using project structure, summaries, and requirements
+            try:
+                # Project structure from file_to_chunks keys
+                paths = sorted(file_to_chunks.keys())
+                structure_lines = []
+                for p in paths:
+                    structure_lines.append(f"- {p}")
+                project_structure_text = "\n".join(structure_lines)
+
+                # Collect file summaries (extract from combined content)
+                file_summaries_text = []
+                for fp, content in combined_docs.items():
+                    # naive extraction: take the last 'File Summary' section if present
+                    marker = "File Summary"
+                    snippet = content
+                    if marker in content:
+                        snippet = content[content.rfind(marker):]
+                    file_summaries_text.append(f"## {fp}\n\n" + snippet[:1500])
+                file_summaries_joined = "\n\n".join(file_summaries_text)
+
+                # Requirements: prefer project requirements.txt, else infer from imports
+                requirements_path = Path(self.project_path) / "requirements.txt"
+                if requirements_path.exists():
+                    requirements_text = requirements_path.read_text(encoding="utf-8")[:4000]
+                else:
+                    # Infer from imports (very rough)
+                    imports = []
+                    for chs in file_to_chunks.values():
+                        for ch in chs:
+                            imports.extend(ch.get("imports", []) or [])
+                    # Extract top-level package names heuristically
+                    pkgs = []
+                    for imp in set(imports):
+                        line = imp.strip()
+                        if line.startswith("from "):
+                            pkg = line.split()[1].split(".")[0]
+                            pkgs.append(pkg)
+                        elif line.startswith("import "):
+                            pkg = line.split()[1].split(",")[0].split(".")[0]
+                            pkgs.append(pkg)
+                    requirements_text = "\n".join(sorted(set(pkgs)))
+
+                readme = doc_generator.generate_project_readme(project_structure_text, file_summaries_joined, requirements_text)
+                if readme:
+                    (self.output_dir / "README.md").write_text(readme, encoding="utf-8")
+                    logger.info("Generated project README.md in output directory")
+            except Exception as e:
+                logger.warning(f"Failed to generate README: {e}")
+
+            # Dependency coverage / graph validation
+            try:
+                total = len(chunks)
+                with_deps = sum(1 for deps in per_chunk_deps if deps)
+                coverage = (with_deps / total * 100.0) if total else 0.0
+                logger.info(f"Dependency coverage: {with_deps}/{total} chunks ({coverage:.1f}%) have dependencies")
+                if coverage == 0.0:
+                    logger.warning("No dependencies were resolved. Check Neo4j connectivity and AST fallback logic.")
+            except Exception:
+                pass
             
             # STEP 7: Build Sphinx HTML
             logger.info("\n[STEP 7/7]  Building Sphinx HTML documentation...")
@@ -208,6 +278,270 @@ class DocumentationPipeline:
         logger.info(f"   • Files processed: {len(set(ch['filepath'] for ch in chunks))}")
         logger.info(f"   • Total lines: {sum(ch['end_line'] - ch['start_line'] + 1 for ch in chunks)}")
         logger.info(f"   • Documentation generated: {len(docs)} chunks")
+class DocGenerator:
+    
+
+    CHUNK_PROMPT_TEMPLATE = (
+        "You are a senior Python engineer writing concise, precise technical docs.\n"
+        "Context: The file is processed in chunks; you will document ONLY the given chunk.\n"
+        "Rules:\n"
+        "- Be clear and simple, avoid verbose theory.\n"
+        "- Do not speculate about usage beyond provided dependencies; if unknown, say so.\n"
+        "- If purpose is not evident, state 'purpose unclear from this chunk'.\n"
+        "- Use Markdown with small sections: Purpose, Parameters, Returns, Exceptions, Notes.\n"
+        "- Do NOT include a header like '## Chunk ...'; that header is already provided.\n"
+        "- Do NOT repeat the raw code; it will be displayed above your documentation.\n"
+        "- Include an explicit 'Dependencies' section listing incoming and outgoing functions using ONLY the provided list.\n"
+        "- Include 'Inter-Module Relationships' summarizing how this chunk interacts with others (based on dependencies and imports).\n"
+        "- Include 'Maintainability & Scalability' notes (readability, modularity, extensibility).\n"
+        "Inputs:\n"
+        "- File: {filepath} (lines {start_line}-{end_line})\n"
+        "- Dependencies (from call graph):\n{dependencies}\n"
+        "- Related context (from RAG):\n{rag_context}\n"
+        "Code:\n```python\n{code}\n```\n"
+        "Write the documentation now."
+    )
+
+    FILE_SUMMARY_PROMPT_TEMPLATE = (
+        "You are a senior Python engineer. Provide a short file-level summary.\n"
+        "Rules: 1-2 short paragraphs max. Focus on purpose, main responsibilities, and key integration points.\n"
+        "Avoid assumptions not supported by code or dependencies.\n"
+        "Inputs:\n"
+        "- File: {filepath}\n"
+        "- Functions/classes: {symbols}\n"
+        "- Imports: {imports}\n"
+        "- Notable dependencies (from call graph):\n{dependencies}\n"
+        "Code (for reference, truncated as needed):\n```python\n{code}\n```\n"
+        "Write the summary now in Markdown under a heading 'File Summary'."
+    )
+
+    README_PROMPT_TEMPLATE = (
+        "You are a senior Python engineer. Generate a high-quality README for the project.\n"
+        "Output sections:\n"
+        "1. Project Overview (brief)\n"
+        "2. Architecture & Structure (summarize directories and key files)\n"
+        "3. Installation (list exact requirements; if a requirements.txt is provided, include it clearly; otherwise infer from imports)\n"
+        "4. Usage (how to run the pipeline/commands)\n"
+        "5. Documentation (where generated docs live)\n"
+        "6. Notes on Call Graph & RAG (how dependencies are handled, limitations)\n"
+        "Inputs:\n"
+        "- Project structure:\n{project_structure}\n"
+        "- File summaries:\n{file_summaries}\n"
+        "- Proposed requirements:\n{requirements_text}\n"
+        "Constraints:\n"
+        "- Keep it concise and accurate.\n"
+        "- Do not fabricate packages; prefer the provided requirements list.\n"
+        "- Use Markdown formatting.\n"
+    )
+
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
+        self.model_name = model_name
+        self._model = None
+
+    def _get_model(self):
+        if self._model is None:
+            self._model = genai.GenerativeModel(self.model_name)
+        return self._model
+
+    def _format_dependencies(self, deps: List[Dict[str, Any]]) -> str:
+        if not deps:
+            return "(none provided)"
+        lines: List[str] = []
+        for d in deps:
+            name = d.get("name", d.get("callee", "?"))
+            location = d.get("location", "")
+            direction = d.get("direction", "outgoing")
+            lines.append(f"- [{direction}] {name} {location}")
+        return "\n".join(lines)
+
+    def _format_rag_context(self, context_chunks: List[Dict[str, Any]]) -> str:
+        if not context_chunks:
+            return "(none)"
+        parts: List[str] = []
+        for i, ctx in enumerate(context_chunks[:5], 1):
+            text = ctx.get("text", "")
+            parts.append(f"Context {i}:\n```python\n{text[:500]}\n```")
+        return "\n\n".join(parts)
+
+    def generate_chunk_doc(
+        self,
+        chunk: Dict[str, Any],
+        dependencies: List[Dict[str, Any]],
+        context_chunks: List[Dict[str, Any]],
+    ) -> str:
+        try:
+            prompt = self.CHUNK_PROMPT_TEMPLATE.format(
+                filepath=chunk.get("filepath", ""),
+                start_line=chunk.get("start_line", 0),
+                end_line=chunk.get("end_line", 0),
+                dependencies=self._format_dependencies(dependencies),
+                rag_context=self._format_rag_context(context_chunks),
+                code=chunk.get("text", ""),
+            )
+            response = self._get_model().generate_content(prompt)
+            text = getattr(response, "text", "") or ""
+            # Remove any model-produced generic chunk headers like "## Chunk X (...)"
+            lines = text.splitlines()
+            filtered = []
+            for line in lines:
+                l = line.strip().lower()
+                if l.startswith("## chunk "):
+                    continue
+                filtered.append(line)
+            return "\n".join(filtered).strip()
+        except Exception as exc:
+            logger.warning(f" LLM generation failed for chunk, returning empty doc: {exc}")
+            return ""
+
+    def generate_project_readme(self, project_structure: str, file_summaries_text: str, requirements_text: str) -> str:
+        try:
+            prompt = self.README_PROMPT_TEMPLATE.format(
+                project_structure=project_structure,
+                file_summaries=file_summaries_text,
+                requirements_text=requirements_text,
+            )
+            response = self._get_model().generate_content(prompt)
+            return getattr(response, "text", "") or ""
+        except Exception as exc:
+            logger.warning(f" LLM generation failed for README, returning empty: {exc}")
+            return ""
+
+    def generate_file_summary(
+        self,
+        filepath: str,
+        file_chunks: List[Dict[str, Any]],
+        file_dependencies: List[Dict[str, Any]],
+    ) -> str:
+        try:
+            # Aggregate code (truncate to keep prompt size reasonable)
+            code_text = "\n\n".join(ch.get("text", "") for ch in file_chunks)
+            if len(code_text) > 6000:
+                code_text = code_text[:6000]
+
+            symbols = ", ".join(ch.get("name", "") for ch in file_chunks if ch.get("name"))
+            imports = []
+            for ch in file_chunks:
+                imports.extend(ch.get("imports", []) or [])
+            imports_str = ", ".join(sorted(set(imports)))[:500]
+
+            prompt = self.FILE_SUMMARY_PROMPT_TEMPLATE.format(
+                filepath=filepath,
+                symbols=symbols or "(none)",
+                imports=imports_str or "(none)",
+                dependencies=self._format_dependencies(file_dependencies),
+                code=code_text,
+            )
+            response = self._get_model().generate_content(prompt)
+            return getattr(response, "text", "") or ""
+        except Exception as exc:
+            logger.warning(f" LLM generation failed for file summary, returning empty: {exc}")
+            return ""
+
+
+class GraphDependencyResolver:
+    """Resolve function dependencies for chunks using Neo4j if available; fallback to AST."""
+
+    def __init__(self, neo4j_uri: str):
+        self.neo4j_uri = neo4j_uri
+        self._driver = None
+        self._connect()
+
+    def _connect(self):
+        try:
+            from neo4j import GraphDatabase
+            user = os.getenv("NEO4J_USER", "neo4j")
+            password = os.getenv("NEO4J_PASSWORD")
+            self._driver = GraphDatabase.driver(self.neo4j_uri, auth=(user, password))
+            with self._driver.session() as sess:
+                sess.run("RETURN 1 as n")
+        except Exception:
+            self._driver = None
+
+    def close(self):
+        try:
+            if self._driver:
+                self._driver.close()
+        except Exception:
+            pass
+
+    def _extract_calls_ast(self, code: str) -> List[str]:
+        try:
+            import ast
+            tree = ast.parse(code)
+            calls: List[str] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    name = self._name_from_node(node.func)
+                    if name:
+                        calls.append(name)
+            return list(sorted(set(calls)))
+        except Exception:
+            return []
+
+    def _name_from_node(self, node) -> Optional[str]:
+        try:
+            import ast
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                parts = []
+                cur = node
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    parts.append(cur.id)
+                parts.reverse()
+                return ".".join(parts)
+        except Exception:
+            return None
+        return None
+
+    def resolve_for_chunk_with_source(self, chunk: Dict[str, Any]) -> (List[Dict[str, Any]], str):
+        # Try Neo4j first by matching functions in the file and range
+        deps: List[Dict[str, Any]] = []
+        if self._driver:
+            try:
+                with self._driver.session() as sess:
+                    # Outgoing calls from the chunk's functions
+                    q_out = (
+                        "MATCH (f:Function) "
+                        "WHERE f.filepath = $fp AND f.start_line >= $s AND f.end_line <= $e "
+                        "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+                        "RETURN g.name as name, g.filepath as gfp, g.start_line as gs, g.end_line as ge"
+                    )
+                    res_out = sess.run(q_out, fp=chunk.get("filepath"), s=chunk.get("start_line", 0), e=chunk.get("end_line", 0))
+                    for r in res_out:
+                        if r["name"]:
+                            deps.append({
+                                "name": r["name"],
+                                "location": f"({r['gfp']}:{r['gs']}-{r['ge']})" if r.get("gfp") else "",
+                                "direction": "outgoing",
+                            })
+                    # Incoming calls to the chunk's functions (same file prioritised)
+                    q_in = (
+                        "MATCH (f:Function) "
+                        "WHERE f.filepath = $fp AND f.start_line >= $s AND f.end_line <= $e "
+                        "MATCH (h:Function)-[:CALLS]->(f) "
+                        "RETURN h.name as name, h.filepath as hfp, h.start_line as hs, h.end_line as he"
+                    )
+                    res_in = sess.run(q_in, fp=chunk.get("filepath"), s=chunk.get("start_line", 0), e=chunk.get("end_line", 0))
+                    for r in res_in:
+                        if r["name"]:
+                            deps.append({
+                                "name": r["name"],
+                                "location": f"({r['hfp']}:{r['hs']}-{r['he']})" if r.get("hfp") else "",
+                                "direction": "incoming",
+                            })
+                if deps:
+                    return deps, "neo4j"
+            except Exception:
+                pass
+        # Fallback to AST extraction of call names when graph is unavailable or empty
+        ast_calls = self._extract_calls_ast(chunk.get("text", ""))
+        for name in ast_calls:
+            deps.append({"name": name, "location": "", "direction": "outgoing"})
+        return deps, "ast"
 
 
 def main():

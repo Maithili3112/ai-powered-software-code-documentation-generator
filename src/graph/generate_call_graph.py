@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class Neo4jGraphBuilder:
     """Builds and manages call graphs in Neo4j."""
     
-    def __init__(self, uri: str = "bolt://localhost:7687", 
+    def __init__(self, uri: str = "neo4j://127.0.0.1:7687", 
                  user: str = "neo4j", 
                  password: Optional[str] = None):
         self.uri = uri
@@ -130,7 +130,7 @@ class PyCGCallGraphGenerator:
     def __init__(self):
         self.graph_builder = None
     
-    def generate_call_graph(self, root_path: str, neo4j_uri: str = "bolt://localhost:7687") -> Dict[str, Any]:
+    def generate_call_graph(self, root_path: str, neo4j_uri: str = "neo4j://127.0.0.1:7687") -> Dict[str, Any]:
         """
         Generate call graph from Python code using PyCG.
         
@@ -429,7 +429,7 @@ class CallGraphVisitor(ast.NodeVisitor):
         return None
 
 
-def generate_graph_for_project(project_path: str, neo4j_uri: str = "bolt://localhost:7687") -> None:
+def generate_graph_for_project(project_path: str, neo4j_uri: str = "neo4j://127.0.0.1:7687") -> None:
     """
     Generate and store call graph for a project.
     

@@ -73,14 +73,12 @@ class RAGContextRetriever:
                 self.collection = self.client.get_collection("codexglue_chunks")
                 logger.info("Connected to RAG ChromaDB (codexglue_chunks)")
             except Exception:
-                logger.warning("RAG collection 'codexglue_chunks' not found. Creating empty collection.")
                 self.collection = self.client.get_or_create_collection(
                     name="codexglue_chunks",
                     metadata={"description": "CodexGLUE dataset chunks"}
                 )
         except Exception as e:
             logger.error(f"Failed to setup RAG ChromaDB: {e}")
-            logger.info("Continuing without RAG context...")
             self.collection = None
     
     def retrieve_context(self, query: str, n_results: int = 5) -> List[Dict[str, Any]]:
@@ -97,14 +95,12 @@ class RAGContextRetriever:
         # If codexglue_chunks is missing or empty, try falling back to the project's code_chunks collection
         try:
             if (not self.collection) or (hasattr(self.collection, 'count') and self.collection.count() == 0):
-                logger.warning("RAG collection is empty or not available. Attempting to fallback to 'code_chunks' collection.")
                 try:
                     # Try to use project collection where code embeddings are stored
                     fallback = self.client.get_collection('code_chunks')
                     logger.info("Falling back to 'code_chunks' collection for retrieval")
                     self.collection = fallback
                 except Exception:
-                    logger.warning("Fallback collection 'code_chunks' not found or empty. No RAG context available.")
                     return []
         except Exception:
             logger.warning("Unable to evaluate RAG collection state; proceeding cautiously.")
@@ -113,7 +109,6 @@ class RAGContextRetriever:
         # Check if collection is empty
         try:
             if self.collection.count() == 0:
-                logger.warning("RAG collection is empty")
                 return []
         except Exception as e:
             logger.warning(f"Could not check collection count: {e}")
