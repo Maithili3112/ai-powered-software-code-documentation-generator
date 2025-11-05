@@ -52,7 +52,7 @@ class Neo4jGraphBuilder:
                         logger.warning(f"Neo4j rate limit hit, waiting {retry_delay}s before retry {attempt + 1}/{max_retries}")
                         time.sleep(retry_delay)
                         continue
-                logger.error(f"Failed to connect to Neo4j: {e}")
+                
                 raise
     
     def close(self):
@@ -142,45 +142,51 @@ class PyCGCallGraphGenerator:
             Dictionary containing call graph data
         """
         logger.info(f"Generating call graph for {root_path}")
-        
-        # Try direct connection first (like test script)
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-            
-            # Get fresh credentials from environment
-            neo4j_uri = os.getenv('NEO4J_URI', neo4j_uri)
-            neo4j_user = os.getenv('NEO4J_USER', 'neo4j')
-            neo4j_password = os.getenv('NEO4J_PASSWORD')
-            
-            # Test connection before creating builder
-            driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
-            with driver.session() as session:
-                session.run("RETURN 1 as n")
-            driver.close()
-            
-            # Now create builder with verified credentials
-            self.graph_builder = Neo4jGraphBuilder(
-                uri=neo4j_uri,
-                user=neo4j_user,
-                password=neo4j_password
-            )
-            self.graph_builder.create_indexes()
-        except Exception as e:
-            logger.error(f"Neo4j connection failed (falling back to JSON): {e}")
-            self.graph_builder = None  # Force JSON fallback
-        
-        try:
-            # Try PyCG first
-            cg_data = self._run_pycg(root_path)
-            if cg_data:
-                self._store_in_neo4j(cg_data, root_path)
-                return cg_data
-        except Exception as e:
-            logger.warning(f"PyCG failed: {e}")
-        
-        # Fallback to AST-based analysis
-        logger.info("Falling back to AST-based call graph generation")
+
+        # Determine feature gates via environment variables (default: AST-only, no Neo4j/PyCG)
+        enable_neo4j = os.getenv('ENABLE_NEO4J', '0') == '1'
+        enable_pycg = os.getenv('ENABLE_PYCG', '0') == '1'
+
+        # Optionally initialize Neo4j if explicitly enabled
+        if enable_neo4j:
+            try:
+                from dotenv import load_dotenv
+                load_dotenv()
+
+                neo4j_uri = os.getenv('NEO4J_URI', neo4j_uri)
+                neo4j_user = os.getenv('NEO4J_USER', 'neo4j')
+                neo4j_password = os.getenv('NEO4J_PASSWORD')
+
+                driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+                with driver.session() as session:
+                    session.run("RETURN 1 as n")
+                driver.close()
+
+                self.graph_builder = Neo4jGraphBuilder(
+                    uri=neo4j_uri,
+                    user=neo4j_user,
+                    password=neo4j_password
+                )
+                self.graph_builder.create_indexes()
+            except Exception as e:
+                # Keep terminal quiet unless explicitly debugging
+                logger.debug(f"Neo4j connection not available: {e}")
+                self.graph_builder = None
+        else:
+            self.graph_builder = None
+
+        # Optionally try PyCG if explicitly enabled
+        if enable_pycg:
+            try:
+                cg_data = self._run_pycg(root_path)
+                if cg_data:
+                    self._store_in_neo4j(cg_data, root_path)
+                    return cg_data
+            except Exception as e:
+                logger.debug(f"PyCG failed, will use AST: {e}")
+
+        # AST-based analysis (default)
+        logger.info("Using AST-based call graph generation")
         cg_data = self._generate_ast_graph(root_path)
         self._store_in_neo4j(cg_data, root_path)
         
@@ -200,6 +206,7 @@ import sys
 try:
     from pycg import callgraph
 except Exception as e:
+    # Print to stdout so the parent process can capture it
     print('PyCG import error:', e)
     sys.exit(1)
 
@@ -222,9 +229,9 @@ if __name__ == '__main__':
                 runner.write(script_content)
                 runner_path = runner.name
 
-            cmd = [sys.executable, runner_path, root_path, output_file]
+            cmd = [sys.executable, '-u', runner_path, root_path, output_file]
             logger.info("Running PyCG via helper script...")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             
             if result.returncode == 0 and Path(output_file).exists():
                 with open(output_file, 'r') as f:
@@ -232,7 +239,43 @@ if __name__ == '__main__':
                 logger.info(f"PyCG generated call graph with {len(cg_data)} functions")
                 return cg_data
             else:
-                logger.warning(f"PyCG subprocess failed: {result.stderr}")
+                logger.warning("PyCG subprocess failed. Stdout/err below:")
+                if result.stdout:
+                    logger.warning(f"[stdout] {result.stdout.strip()}")
+                if result.stderr:
+                    logger.warning(f"[stderr] {result.stderr.strip()}")
+
+                # Fallback 1: try in-process import and call (same interpreter)
+                try:
+                    logger.info("Attempting in-process PyCG call as fallback...")
+                    from pycg import callgraph as _cg
+                    _cg.generate_callgraph(root_path, output_file, max_iter=5)
+                    if Path(output_file).exists():
+                        with open(output_file, 'r') as f:
+                            cg_data = json.load(f)
+                        logger.info(f"PyCG (in-process) generated call graph with {len(cg_data)} functions")
+                        return cg_data
+                except Exception as e:
+                    logger.warning(f"In-process PyCG failed: {e}")
+
+                # Fallback 2: try module execution `python -m pycg` if available
+                try:
+                    logger.info("Attempting 'python -m pycg' module execution...")
+                    result2 = subprocess.run([sys.executable, '-m', 'pycg', root_path, output_file], capture_output=True, text=True, timeout=600)
+                    if result2.returncode == 0 and Path(output_file).exists():
+                        with open(output_file, 'r') as f:
+                            cg_data = json.load(f)
+                        logger.info(f"PyCG (module) generated call graph with {len(cg_data)} functions")
+                        return cg_data
+                    else:
+                        logger.warning("'python -m pycg' failed.")
+                        if result2.stdout:
+                            logger.warning(f"[stdout] {result2.stdout.strip()}")
+                        if result2.stderr:
+                            logger.warning(f"[stderr] {result2.stderr.strip()}")
+                except Exception as e:
+                    logger.warning(f"Module execution fallback failed: {e}")
+
                 return None
                 
         except subprocess.TimeoutExpired:
@@ -245,7 +288,8 @@ if __name__ == '__main__':
             # Clean up temp file
             try:
                 if 'output_file' in locals() and Path(output_file).exists():
-                    Path(output_file).unlink()
+                    # Only clean up the helper runner; keep output_file for inspection if failures occurred
+                    pass
             except:
                 pass
     
@@ -346,7 +390,8 @@ if __name__ == '__main__':
                         self.graph_builder.add_call_relation(func_name, called_func)
             
             except Exception as e:
-                logger.warning(f"Error processing {py_file}: {e}")
+                # Downgrade per-file analysis issues to debug to avoid noisy terminal
+                logger.debug(f"AST processing issue for {py_file}: {e}")
         
         logger.info(f"AST analysis found {len(cg_data)} functions")
         return cg_data
