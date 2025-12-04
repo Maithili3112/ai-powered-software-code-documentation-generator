@@ -1,0 +1,23 @@
+# Do not track environment files
+.env
+
+# Do not track RAG chunks
+chunks.jsonl
+
+# Documentation folder
+docs/
+
+# Index file
+index.md
+
+# Chroma database
+rag_chroma/
+chroma_stroe/
+# Python cache files
+src/graph/graphviz/__pycache__/
+
+# General Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

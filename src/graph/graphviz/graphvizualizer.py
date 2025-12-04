@@ -95,6 +95,8 @@ class GraphVisualizer(QMainWindow):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Enter node name...")
         self.search_input.textChanged.connect(self.on_search)
+        # Pressing Enter will attempt to isolate the first matching node
+        self.search_input.returnPressed.connect(self.on_search_activate)
         layout.addWidget(self.search_input)
 
         layout.addWidget(QLabel("🧭 Filter by Edge Type:"))
@@ -226,9 +228,46 @@ class GraphVisualizer(QMainWindow):
 
     def on_search(self):
         """Highlight nodes that match search"""
-        query = self.search_input.text().strip().lower()
-        self.highlighted_nodes = {n for n in self.graph.nodes() if query in n.lower()} if query else set()
+        query = self.search_input.text().strip()
+        self.highlighted_nodes = self.search_nodes(query)
         self.update_graph()
+
+    def search_nodes(self, query: str):
+        """Return a set of nodes matching the query (case-insensitive substring).
+
+        This helper is safe for non-string node keys by coercing to `str` before
+        lowercasing. It returns the actual node objects (not their string forms)
+        which keeps compatibility with NetworkX node keys.
+        """
+        if not query:
+            return set()
+        q = query.strip().lower()
+        matches = set()
+        for n in self.graph.nodes():
+            try:
+                name = str(n)
+            except Exception:
+                continue
+            if q in name.lower():
+                matches.add(n)
+        return matches
+
+    def on_search_activate(self):
+        """Called when the user presses Enter in the search box.
+
+        If there is at least one matching node, isolate the first match so the
+        user can focus on it immediately.
+        """
+        matches = list(self.search_nodes(self.search_input.text()))
+        if not matches:
+            return
+        first = matches[0]
+        # If the node exists in the current graph, isolate it
+        if first in self.graph:
+            self.isolate_node(first)
+            # ensure the highlight set includes the isolated node
+            self.highlighted_nodes = {first}
+            self.update_graph(isolated=True)
 
     def on_click(self, event):
         """Handle mouse clicks on canvas to detect node selection"""

@@ -13,8 +13,9 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 # Load environment variables from .env file
 try:
@@ -39,7 +40,7 @@ from src.graph.generate_call_graph import Neo4jGraphBuilder, PyCGCallGraphGenera
 from src.rag.rag_context import RAGContextRetriever
 import google.generativeai as genai
 from src.reassembly.reassemble_docs import DocReassembler
-from src.web.sphinx_builder import SphinxBuilder
+from src.graph.graphviz.graphformmater import build_graphcommons_files
 from src.utils.helpers import save_chunks_to_jsonl, load_chunks_from_jsonl, group_chunks_by_file, extract_project_stats
 
 class DocumentationPipeline:
@@ -50,7 +51,6 @@ class DocumentationPipeline:
                  rag_chroma_path: str = "./rag_chroma",
                  neo4j_uri: Optional[str] = None,
                  output_dir: str = "./generated_docs",
-                 docs_output_dir: str = "./docs",
                  google_api_key: Optional[str] = None):
         
         self.project_path = Path(project_path)
@@ -59,17 +59,11 @@ class DocumentationPipeline:
         # Prefer explicit parameter, otherwise use environment NEO4J_URI, fallback to localhost
         self.neo4j_uri = neo4j_uri or os.getenv('NEO4J_URI', 'neo4j://127.0.0.1:7687')
         self.output_dir = Path(output_dir)
-        self.docs_output_dir = Path(docs_output_dir)
-        self.google_api_key = google_api_key or os.getenv("GOOGLE_API_KEY")
-        if self.google_api_key:
-            try:
-                genai.configure(api_key=self.google_api_key)
-            except Exception as e:
-                logger.warning(f" Failed to configure Gemma: {e}")
+        self.gemma_interface_key = google_api_key or os.getenv("GEMMA_INTERFACE_KEY")
+        # We keep this for backward compatibility but don't configure genai here
         
-        # Ensure output directories exist
+        # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.docs_output_dir.mkdir(parents=True, exist_ok=True)
         
         self.chunks_output = self.output_dir / "chunks.jsonl"
     
@@ -113,7 +107,16 @@ class DocumentationPipeline:
             
             # STEP 5: Generate Documentation
             logger.info("\n[STEP 5/7]   Generating documentation using LLM...")
-            doc_generator = DocGenerator()
+            # Collect API keys for DocGenerator
+            api_keys = []
+            if self.gemma_interface_key:
+                api_keys.append(self.gemma_interface_key)
+            # Check for second API key
+            secondary_key = os.getenv("GEMMA_INTERFACE_KEY_2")
+            if secondary_key:
+                api_keys.append(secondary_key)
+            
+            doc_generator = DocGenerator(api_keys=api_keys if api_keys else None)
             dep_resolver = GraphDependencyResolver(self.neo4j_uri)
             
             docs = []
@@ -178,12 +181,24 @@ class DocumentationPipeline:
             logger.info(f"Reassembled documentation for {len(combined_docs)} files")
 
             # Write dependency CSV (especially useful if AST fallback was used)
+            dep_csv_path = self.output_dir / "function_dependencies.csv"
             try:
-                dep_csv_path = self.output_dir / "function_dependencies.csv"
                 dep_csv_path.write_text("\n".join(dep_csv_rows), encoding="utf-8")
                 logger.info(f"Wrote dependency CSV to {dep_csv_path}")
             except Exception as e:
                 logger.warning(f"Failed to write dependency CSV: {e}")
+
+            # Build graph data (nodes/edges CSVs) for visualization
+            try:
+                logger.info("Building function dependency graph data (nodes/edges CSVs)...")
+                build_graphcommons_files(
+                    dependencies_csv=str(dep_csv_path),
+                    edges_output="./src/graph/graphviz/connections_graphcommons.csv",
+                    nodes_output="./src/graph/graphviz/nodes_graphcommons.csv",
+                )
+                logger.info("Function dependency graph CSVs generated.")
+            except Exception as e:
+                logger.warning(f"Failed to build dependency graph CSVs (continuing): {e}")
 
             # Generate README using project structure, summaries, and requirements
             try:
@@ -245,18 +260,7 @@ class DocumentationPipeline:
             except Exception:
                 pass
             
-            # STEP 7: Build Sphinx HTML
-            logger.info("\n[STEP 7/7]  Building Sphinx HTML documentation...")
-            builder = SphinxBuilder(
-                source_dir=str(self.output_dir),
-                output_dir=str(self.docs_output_dir)
-            )
-            success = builder.build_all()
-            
-            if success:
-                logger.info(f"✓ Built Sphinx documentation at {builder.build_dir}")
-            
-            # Print statistics
+            # Final statistics
             self._print_stats(chunks, docs)
             
             logger.info("\n" + "=" * 80)
@@ -278,6 +282,146 @@ class DocumentationPipeline:
         logger.info(f"   • Files processed: {len(set(ch['filepath'] for ch in chunks))}")
         logger.info(f"   • Total lines: {sum(ch['end_line'] - ch['start_line'] + 1 for ch in chunks)}")
         logger.info(f"   • Documentation generated: {len(docs)} chunks")
+class GeminiAPIKeyManager:
+    """Manages multiple Gemini API keys with automatic fallback on rate limits."""
+    
+    def __init__(self, api_keys: List[str], model_name: str = "gemini-2.5-flash"):
+        """
+        Initialize the API key manager.
+        
+        Args:
+            api_keys: List of API keys to use (at least one required)
+            model_name: Gemini model name to use
+        """
+        if not api_keys or not any(api_keys):
+            raise ValueError("At least one API key is required")
+        
+        # Filter out None/empty keys
+        self.api_keys = [key for key in api_keys if key]
+        if not self.api_keys:
+            raise ValueError("No valid API keys provided")
+        
+        self.model_name = model_name
+        self.current_key_index = 0
+        self.models = {}  # Cache models for each key
+        self.rate_limited_keys = set()  # Track which keys are currently rate limited
+        self.rate_limit_reset_time = {}  # Track when rate limits reset (60 seconds)
+    
+    def _is_rate_limit_error(self, error: Exception) -> bool:
+        """Check if an error is a rate limit error."""
+        error_str = str(error).lower()
+        error_type = type(error).__name__.lower()
+        
+        # Check for common rate limit indicators
+        rate_limit_indicators = [
+            "429",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "quota exceeded",
+            "resource exhausted",
+            "per minute",
+            "requests per minute",
+            "rpm",
+            "quotaexceeded",
+        ]
+        
+        return any(indicator in error_str for indicator in rate_limit_indicators) or "429" in error_type
+    
+    def _get_current_key(self) -> str:
+        """Get the currently active API key."""
+        return self.api_keys[self.current_key_index]
+    
+    def _switch_to_next_key(self):
+        """Switch to the next available API key."""
+        current_time = time.time()
+        
+        # Check if any rate-limited keys can be reset (60 seconds passed)
+        keys_to_reset = []
+        for key_idx, reset_time in self.rate_limit_reset_time.items():
+            if current_time >= reset_time:
+                keys_to_reset.append(key_idx)
+        
+        for key_idx in keys_to_reset:
+            self.rate_limited_keys.discard(key_idx)
+            del self.rate_limit_reset_time[key_idx]
+            logger.info(f"API key {key_idx + 1} is now available again after rate limit reset")
+        
+        # Try to find a non-rate-limited key
+        original_index = self.current_key_index
+        attempts = 0
+        
+        while attempts < len(self.api_keys):
+            if self.current_key_index not in self.rate_limited_keys:
+                if self.current_key_index != original_index:
+                    logger.info(f"Switched to API key {self.current_key_index + 1}")
+                return
+            
+            # Move to next key
+            self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            attempts += 1
+        
+        # If all keys are rate limited, use the current one anyway and log warning
+        logger.warning(f"All API keys are rate limited. Using key {self.current_key_index + 1} and will retry...")
+    
+    def _get_model(self, api_key: str):
+        """Get or create a model instance for the given API key."""
+        if api_key not in self.models:
+            genai.configure(api_key=api_key)
+            self.models[api_key] = genai.GenerativeModel(self.model_name)
+        return self.models[api_key]
+    
+    def generate_content(self, prompt: str, max_retries: int = 2):
+        """
+        Generate content using the current API key, with automatic fallback on rate limits.
+        
+        Args:
+            prompt: The prompt to send to the model
+            max_retries: Maximum number of retries with different keys
+            
+        Returns:
+            Response from the model
+            
+        Raises:
+            Exception: If all keys fail or non-rate-limit error occurs
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                # Get current key and ensure genai is configured with it
+                current_key = self._get_current_key()
+                # Reconfigure genai with current key (in case we switched)
+                genai.configure(api_key=current_key)
+                model = self._get_model(current_key)
+                
+                # Try to generate content
+                response = model.generate_content(prompt)
+                return response
+                
+            except Exception as e:
+                if self._is_rate_limit_error(e):
+                    # Mark current key as rate limited
+                    self.rate_limited_keys.add(self.current_key_index)
+                    self.rate_limit_reset_time[self.current_key_index] = time.time() + 60  # Reset after 60 seconds
+                    # Switch to next key
+                    self._switch_to_next_key()
+                    
+                    # If we have more attempts, continue
+                    if attempt < max_retries:
+                       
+                        continue
+                    else:
+                        # All keys exhausted, raise the error
+                        logger.error("All interface have hit rate limits. Please wait before retrying.")
+                        raise
+                else:
+                    # Non-rate-limit error, raise immediately
+                    
+                    raise
+        
+        # Should not reach here, but just in case
+        raise Exception("Failed to generate content after all retries")
+
+
 class DocGenerator:
     
 
@@ -334,14 +478,31 @@ class DocGenerator:
         "- Use Markdown formatting.\n"
     )
 
-    def __init__(self, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, model_name: str = "gemini-2.5-flash", api_keys: Optional[List[str]] = None):
+        """
+        Initialize the DocGenerator.
+        
+        Args:
+            model_name: Gemini model name to use
+            api_keys: List of API keys (supports multiple keys for fallback)
+        """
         self.model_name = model_name
-        self._model = None
-
-    def _get_model(self):
-        if self._model is None:
-            self._model = genai.GenerativeModel(self.model_name)
-        return self._model
+        
+        # Get API keys from parameter or environment
+        if api_keys:
+            keys = api_keys
+        else:
+            # Try to get multiple keys from environment
+            primary_key = os.getenv("GEMMA_INTERFACE_KEY")
+            secondary_key = os.getenv("GEMMA_INTERFACE_KEY_2")
+            keys = [k for k in [primary_key, secondary_key] if k]
+        
+        # Initialize API key manager
+        if keys:
+            self.api_key_manager = GeminiAPIKeyManager(keys, model_name)
+        else:
+            self.api_key_manager = None
+            logger.warning("No Gemini API keys found. Documentation generation may fail.")
 
     def _format_dependencies(self, deps: List[Dict[str, Any]]) -> str:
         if not deps:
@@ -378,7 +539,11 @@ class DocGenerator:
                 rag_context=self._format_rag_context(context_chunks),
                 code=chunk.get("text", ""),
             )
-            response = self._get_model().generate_content(prompt)
+            if not self.api_key_manager:
+                logger.error("No API key manager available. Cannot generate documentation.")
+                return ""
+            
+            response = self.api_key_manager.generate_content(prompt)
             text = getattr(response, "text", "") or ""
             # Remove any model-produced generic chunk headers like "## Chunk X (...)"
             lines = text.splitlines()
@@ -400,7 +565,11 @@ class DocGenerator:
                 file_summaries=file_summaries_text,
                 requirements_text=requirements_text,
             )
-            response = self._get_model().generate_content(prompt)
+            if not self.api_key_manager:
+                logger.error("No API key manager available. Cannot generate README.")
+                return ""
+            
+            response = self.api_key_manager.generate_content(prompt)
             return getattr(response, "text", "") or ""
         except Exception as exc:
             logger.warning(f" LLM generation failed for README, returning empty: {exc}")
@@ -431,7 +600,11 @@ class DocGenerator:
                 dependencies=self._format_dependencies(file_dependencies),
                 code=code_text,
             )
-            response = self._get_model().generate_content(prompt)
+            if not self.api_key_manager:
+                logger.error("No API key manager available. Cannot generate file summary.")
+                return ""
+            
+            response = self.api_key_manager.generate_content(prompt)
             return getattr(response, "text", "") or ""
         except Exception as exc:
             logger.warning(f" LLM generation failed for file summary, returning empty: {exc}")
@@ -497,7 +670,7 @@ class GraphDependencyResolver:
             return None
         return None
 
-    def resolve_for_chunk_with_source(self, chunk: Dict[str, Any]) -> (List[Dict[str, Any]], str):
+    def resolve_for_chunk_with_source(self, chunk: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
         # Try Neo4j first by matching functions in the file and range
         deps: List[Dict[str, Any]] = []
         if self._driver:
@@ -581,14 +754,15 @@ def main():
     )
     
     parser.add_argument(
-        "--docs-dir",
-        default="./docs",
-        help="Sphinx docs directory (default: ./docs)"
+        "--gemma-interface-key",
+        dest="gemma_interface_key",
+        help="Gemma interface key (or use GEMMA_INTERFACE_KEY env var). For fallback, also set GEMMA_INTERFACE_KEY_2 env var."
     )
-    
+
     parser.add_argument(
-        "--google-api-key",
-        help="Google API key (or use GOOGLE_API_KEY env var)"
+        "--read_from_input",
+        action="store_true",
+        help="Flag maintained for backward compatibility; input is always read from the provided project_path."
     )
     
     args = parser.parse_args()
@@ -605,8 +779,7 @@ def main():
         rag_chroma_path=args.rag_chroma_path,
         neo4j_uri=args.neo4j_uri,
         output_dir=args.output_dir,
-        docs_output_dir=args.docs_dir,
-        google_api_key=args.google_api_key
+        google_api_key=args.gemma_interface_key
     )
     
     success = pipeline.run()
